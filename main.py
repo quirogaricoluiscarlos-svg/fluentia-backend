@@ -6,6 +6,7 @@ load_dotenv()
 
 import asyncio
 import logging
+import os
 
 from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +30,8 @@ from services import (
     get_pronunciation_guides,
     transcribe_audio,
 )
+from quality_log import cleanup_old_records, get_metrics
+from test_quality import run_golden_set
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,6 +44,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_cleanup():
+    await cleanup_old_records(30)
 
 
 class PronunciationGuide(BaseModel):
@@ -252,3 +260,29 @@ async def curriculum(level: str):
 async def progression_check(level: str = Query(...), scores: list[float] = Query(...)):
     result = check_level_progression(level.upper(), scores)
     return result
+
+
+# ─── F4: Eval endpoints ───
+
+
+def _check_eval_key(key: str):
+    expected = os.getenv("EVAL_KEY", "")
+    if not expected or key != expected:
+        raise HTTPException(status_code=403, detail="Invalid eval key.")
+
+
+@app.get("/eval/run")
+async def eval_run(x_eval_key: str = Header("")):
+    _check_eval_key(x_eval_key)
+    result = await run_golden_set("http://localhost:8000")
+    return result
+
+
+@app.get("/eval/metrics")
+async def eval_metrics(
+    hours: int = Query(default=24, ge=1, le=720),
+    x_eval_key: str = Header(""),
+):
+    _check_eval_key(x_eval_key)
+    metrics = await get_metrics(hours)
+    return metrics

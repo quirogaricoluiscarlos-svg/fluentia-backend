@@ -3,7 +3,12 @@
 import json
 import logging
 
+import time
+
 from services import deepseek_client, transcribe_audio
+
+from guardrails import validate_placement_eval
+from quality_log import log_ai_call
 
 logger = logging.getLogger(__name__)
 
@@ -104,28 +109,47 @@ async def evaluate_placement_item(
             "feedback": "No se detectó habla. Intentá de nuevo.",
         }
 
-    try:
-        prompt = EVALUATE_PROMPT.format(
-            level=item["level"],
-            expected=item["phrase"],
-            actual=transcription.strip(),
-        )
-        response = await deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": prompt},
-            ],
-            temperature=0.2,
-            response_format={"type": "json_object"},
-        )
-        text = response.choices[0].message.content.strip()
-        data = json.loads(text)
-        score = min(100, max(0, int(data.get("score", 0))))
-        feedback = data.get("feedback", "")
-    except Exception as e:
-        logger.error("Placement evaluation failed: %s", e)
+    eval_data = None
+    for attempt in range(2):
+        start = time.time()
+        try:
+            prompt = EVALUATE_PROMPT.format(
+                level=item["level"],
+                expected=item["phrase"],
+                actual=transcription.strip(),
+            )
+            response = await deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": prompt},
+                ],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            text = response.choices[0].message.content.strip()
+            data = json.loads(text)
+            valid, reason = validate_placement_eval(data)
+            latency = int((time.time() - start) * 1000)
+            await log_ai_call(
+                "evaluate_placement_item", transcription.strip(), text, valid, attempt, latency
+            )
+            if valid:
+                eval_data = data
+                break
+            logger.warning("Placement eval guardrail failed (attempt %d): %s", attempt + 1, reason)
+        except Exception as e:
+            latency = int((time.time() - start) * 1000)
+            await log_ai_call(
+                "evaluate_placement_item", transcription.strip(), "", False, attempt, latency, str(e)
+            )
+            logger.error("Placement evaluation failed: %s", e)
+
+    if eval_data:
+        score = min(100, max(0, int(eval_data.get("score", 0))))
+        feedback = eval_data.get("feedback", "")
+    else:
         score = 50
-        feedback = "No se pudo evaluar completamente."
+        feedback = "No se pudo evaluar completamente. Intentá de nuevo."
 
     return {
         "item_id": item["id"],

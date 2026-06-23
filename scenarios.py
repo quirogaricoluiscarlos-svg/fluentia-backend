@@ -5,7 +5,12 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 
+import time
+
 from services import deepseek_client, transcribe_audio
+
+from guardrails import validate_scenario_turn
+from quality_log import log_ai_call
 
 logger = logging.getLogger(__name__)
 
@@ -155,21 +160,43 @@ async def process_turn(
 
     system_prompt = _build_system_prompt(scenario, session.objectives_met)
 
-    try:
-        response = await deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                *session.messages,
-            ],
-            temperature=0.4,
-            response_format={"type": "json_object"},
-        )
-        text = response.choices[0].message.content.strip()
-        data = json.loads(text)
-    except Exception as e:
-        logger.error("Scenario turn failed: %s", e)
-        return {"error": "Error al procesar el turno. Intentá de nuevo."}
+    ai_data = None
+    for attempt in range(2):
+        start = time.time()
+        try:
+            response = await deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    *session.messages,
+                ],
+                temperature=0.4,
+                response_format={"type": "json_object"},
+            )
+            text = response.choices[0].message.content.strip()
+            data = json.loads(text)
+            valid, reason = validate_scenario_turn(data)
+            latency = int((time.time() - start) * 1000)
+            await log_ai_call(
+                "process_turn", transcription, text, valid, attempt, latency
+            )
+            if valid:
+                ai_data = data
+                break
+            logger.warning("Scenario turn guardrail failed (attempt %d): %s", attempt + 1, reason)
+        except Exception as e:
+            latency = int((time.time() - start) * 1000)
+            await log_ai_call(
+                "process_turn", transcription, "", False, attempt, latency, str(e)
+            )
+            logger.error("Scenario turn failed: %s", e)
+            if attempt == 1:
+                return {"error": "Error al procesar el turno. Intentá de nuevo."}
+
+    if ai_data is None:
+        return {"error": "No pudimos generar una respuesta válida. Intentá de nuevo."}
+
+    data = ai_data
 
     ai_response = data.get("ai_response", "")
     correction = data.get("correction")

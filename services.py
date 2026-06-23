@@ -5,9 +5,18 @@ import json
 import logging
 import os
 
+import time
+
 import httpx
 from groq import AsyncGroq
 from openai import AsyncOpenAI
+
+from guardrails import (
+    validate_correction,
+    validate_pronunciation_guides,
+    validate_transcription,
+)
+from quality_log import log_ai_call
 
 logger = logging.getLogger(__name__)
 
@@ -44,31 +53,61 @@ Solo JSON, sin texto adicional."""
 
 
 async def transcribe_audio(audio_bytes: bytes, filename: str) -> str:
-    transcription = await groq_client.audio.transcriptions.create(
-        file=(filename, audio_bytes),
-        model="whisper-large-v3",
-        language="en",
-    )
-    return transcription.text
+    start = time.time()
+    error_msg = None
+    try:
+        transcription = await groq_client.audio.transcriptions.create(
+            file=(filename, audio_bytes),
+            model="whisper-large-v3",
+            language="en",
+        )
+        text = transcription.text
+        valid, reason = validate_transcription(text)
+        latency = int((time.time() - start) * 1000)
+        await log_ai_call("transcribe_audio", filename, text, valid, 0, latency)
+        if not valid:
+            logger.warning("Transcription guardrail failed: %s", reason)
+            return ""
+        return text
+    except Exception as e:
+        error_msg = str(e)
+        latency = int((time.time() - start) * 1000)
+        await log_ai_call("transcribe_audio", filename, "", False, 0, latency, error_msg)
+        raise
 
 
 async def correct_grammar(transcription: str) -> tuple[str | None, str | None]:
-    try:
-        response = await deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": CORRECTION_PROMPT},
-                {"role": "user", "content": transcription},
-            ],
-            temperature=0.3,
-            response_format={"type": "json_object"},
-        )
-        text = response.choices[0].message.content.strip()
-        data = json.loads(text)
-        return data.get("correction"), data.get("explanation")
-    except Exception as e:
-        logger.error("DeepSeek correction failed: %s", e)
-        return None, None
+    for attempt in range(2):
+        start = time.time()
+        try:
+            response = await deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": CORRECTION_PROMPT},
+                    {"role": "user", "content": transcription},
+                ],
+                temperature=0.3,
+                response_format={"type": "json_object"},
+            )
+            text = response.choices[0].message.content.strip()
+            data = json.loads(text)
+            valid, reason = validate_correction(data)
+            latency = int((time.time() - start) * 1000)
+            await log_ai_call(
+                "correct_grammar", transcription, text, valid, attempt, latency
+            )
+            if valid:
+                return data.get("correction"), data.get("explanation")
+            logger.warning("Correction guardrail failed (attempt %d): %s", attempt + 1, reason)
+        except Exception as e:
+            latency = int((time.time() - start) * 1000)
+            await log_ai_call(
+                "correct_grammar", transcription, "", False, attempt, latency, str(e)
+            )
+            logger.error("DeepSeek correction failed: %s", e)
+            if attempt == 1:
+                return None, None
+    return None, "No pudimos evaluar tu respuesta. Intentá de nuevo."
 
 
 async def assess_pronunciation(
@@ -140,22 +179,38 @@ async def assess_pronunciation(
 async def get_pronunciation_guides(words: list[str]) -> list[dict]:
     if not words:
         return []
-    try:
-        response = await deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": PRONUNCIATION_GUIDE_PROMPT},
-                {"role": "user", "content": json.dumps(words)},
-            ],
-            temperature=0.2,
-            response_format={"type": "json_object"},
-        )
-        text = response.choices[0].message.content.strip()
-        data = json.loads(text)
-        return data.get("guides", [])
-    except Exception as e:
-        logger.error("Pronunciation guide failed: %s", e)
-        return []
+    words_str = json.dumps(words)
+    for attempt in range(2):
+        start = time.time()
+        try:
+            response = await deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": PRONUNCIATION_GUIDE_PROMPT},
+                    {"role": "user", "content": words_str},
+                ],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            text = response.choices[0].message.content.strip()
+            data = json.loads(text)
+            valid, reason = validate_pronunciation_guides(data)
+            latency = int((time.time() - start) * 1000)
+            await log_ai_call(
+                "get_pronunciation_guides", words_str, text, valid, attempt, latency
+            )
+            if valid:
+                return data.get("guides", [])
+            logger.warning("Pronunciation guide guardrail failed (attempt %d): %s", attempt + 1, reason)
+        except Exception as e:
+            latency = int((time.time() - start) * 1000)
+            await log_ai_call(
+                "get_pronunciation_guides", words_str, "", False, attempt, latency, str(e)
+            )
+            logger.error("Pronunciation guide failed: %s", e)
+            if attempt == 1:
+                return []
+    return []
 
 
 async def generate_tts(text: str) -> bytes | None:
