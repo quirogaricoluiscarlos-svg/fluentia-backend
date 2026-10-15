@@ -1,13 +1,16 @@
 """Fluentia AI — Golden set evaluation (F4).
 
-Runs ~20 test cases against the live backend endpoints.
-Can be invoked as a script or imported by the /eval/run endpoint.
+The authenticated /eval/run endpoint imports the provider-side runner.
+The CLI only requests GET /eval/run on its selected backend, using the temporary
+operator environment variables EVAL_ID_TOKEN (raw admin ID token) and EVAL_KEY
+(at least 32 characters). It never invokes providers locally.
 """
 
 import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -129,7 +132,7 @@ async def _test_grammar(client: httpx.AsyncClient, base_url: str) -> list[dict]:
     for case in GRAMMAR_CASES:
         try:
             from services import correct_grammar
-            correction, explanation = await correct_grammar(case["input"])
+            correction, explanation = await correct_grammar(case["input"], strict=True)
             passed = True
             reason = ""
 
@@ -219,15 +222,16 @@ async def _test_placement(client: httpx.AsyncClient, base_url: str) -> list[dict
     return results
 
 
-async def _test_scenarios(client: httpx.AsyncClient, base_url: str) -> list[dict]:
+async def _test_scenarios(client: httpx.AsyncClient, base_url: str, owner_id: str = "quality-evaluation") -> list[dict]:
     results = []
     for case in SCENARIO_CASES:
+        session_id = None
         try:
-            from scenarios import start_scenario, _sessions, SCENARIOS as SCENARIO_DEFS, deepseek_client, _build_system_prompt
+            from scenarios import start_scenario, end_scenario, _sessions, SCENARIOS as SCENARIO_DEFS, deepseek_client, _build_system_prompt
             import json as _json
 
-            result = start_scenario(case["scenario_id"])
-            if not result:
+            result = start_scenario(case["scenario_id"], owner_id=owner_id)
+            if not isinstance(result, tuple):
                 results.append({"case": case["name"], "passed": False, "reason": "Failed to start scenario"})
                 continue
 
@@ -255,15 +259,16 @@ async def _test_scenarios(client: httpx.AsyncClient, base_url: str) -> list[dict
             from guardrails import validate_scenario_turn
             valid, reason = validate_scenario_turn(data)
 
-            del _sessions[session_id]
-
             results.append({"case": case["name"], "passed": valid, "reason": reason if not valid else ""})
         except Exception as e:
             results.append({"case": case["name"], "passed": False, "reason": str(e)})
+        finally:
+            if session_id is not None:
+                end_scenario(session_id, owner_id=owner_id)
     return results
 
 
-async def _test_transcription(client: httpx.AsyncClient, base_url: str) -> list[dict]:
+async def _test_transcription(client: httpx.AsyncClient, base_url: str, authorization: str = "") -> list[dict]:
     results = []
     for case in TRANSCRIPTION_CASES:
         try:
@@ -274,23 +279,23 @@ async def _test_transcription(client: httpx.AsyncClient, base_url: str) -> list[
 
             response = await client.post(
                 f"{base_url}/assess",
+                data={"activity_id": "f1"},
+                headers={"Authorization": authorization},
                 files={"audio": ("test.wav", audio, "audio/wav")},
                 timeout=30.0,
             )
 
-            passed = True
-            reason = ""
-
-            if case["audio_type"] == "silence":
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("transcription", "").strip():
-                        passed = False
-                        reason = f"Should detect empty audio but got: {data['transcription'][:50]}"
-            else:
-                if response.status_code not in (200, 502):
-                    passed = False
-                    reason = f"Unexpected status {response.status_code}"
+            passed = False
+            reason = f"Unexpected status {response.status_code}"
+            if response.status_code == 200:
+                data = response.json()
+                passed = (
+                    data.get("evaluation_status") == "no_speech"
+                    and data.get("grammar_status") == "unavailable"
+                    and data.get("transcription") == ""
+                    and data.get("pronunciation") is None
+                )
+                reason = "" if passed else "Non-speech audio was not explicitly rejected as no_speech"
 
             results.append({"case": case["name"], "passed": passed, "reason": reason})
         except Exception as e:
@@ -301,11 +306,13 @@ async def _test_transcription(client: httpx.AsyncClient, base_url: str) -> list[
 # --- Main runner ---
 
 
-async def run_golden_set(base_url: str = DEFAULT_BASE_URL) -> dict:
+async def run_golden_set(base_url: str = DEFAULT_BASE_URL, *, authorization: str = "",
+                         owner_id: str = "quality-evaluation",
+                         transport: httpx.AsyncBaseTransport | None = None) -> dict:
     start = time.time()
     all_results = []
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(transport=transport) as client:
         grammar_results = await _test_grammar(client, base_url)
         all_results.extend(grammar_results)
 
@@ -315,10 +322,10 @@ async def run_golden_set(base_url: str = DEFAULT_BASE_URL) -> dict:
         placement_results = await _test_placement(client, base_url)
         all_results.extend(placement_results)
 
-        scenario_results = await _test_scenarios(client, base_url)
+        scenario_results = await _test_scenarios(client, base_url, owner_id)
         all_results.extend(scenario_results)
 
-        transcription_results = await _test_transcription(client, base_url)
+        transcription_results = await _test_transcription(client, base_url, authorization)
         all_results.extend(transcription_results)
 
     duration = time.time() - start
@@ -337,10 +344,51 @@ async def run_golden_set(base_url: str = DEFAULT_BASE_URL) -> dict:
     }
 
 
+async def fetch_remote_golden_set(base_url: str, *, id_token: str, eval_key: str,
+                                 transport: httpx.AsyncBaseTransport | None = None) -> dict:
+    """Request an authenticated backend evaluation; do not load provider code."""
+    if not id_token.strip() or len(eval_key) < 32:
+        raise ValueError("Configura EVAL_ID_TOKEN y EVAL_KEY de al menos 32 caracteres.")
+    async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+        response = await client.get(
+            f"{base_url.rstrip('/')}/eval/run",
+            headers={"Authorization": f"Bearer {id_token.strip()}", "X-Eval-Key": eval_key},
+            timeout=130.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+    if not isinstance(result, dict):
+        raise ValueError("El backend devolvió un resultado de evaluación inválido.")
+    total, passed, failed = (result.get(field) for field in ("total", "passed", "failed"))
+    if (any(type(value) is not int for value in (total, passed, failed))
+            or total < 1 or passed < 0 or failed < 0 or passed + failed != total):
+        raise ValueError("El backend devolvió un resultado de evaluación inválido.")
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if len(arguments) > 1:
+        print("Uso: python test_quality.py [URL_BACKEND]", file=sys.stderr)
+        return 2
+    id_token, eval_key = os.getenv("EVAL_ID_TOKEN", ""), os.getenv("EVAL_KEY", "")
+    if not id_token.strip() or len(eval_key) < 32:
+        print("Configura EVAL_ID_TOKEN y EVAL_KEY de al menos 32 caracteres en el entorno del operador.",
+              file=sys.stderr)
+        return 2
+    base_url = arguments[0] if arguments else DEFAULT_BASE_URL
+    try:
+        result = asyncio.run(fetch_remote_golden_set(base_url, id_token=id_token, eval_key=eval_key))
+    except httpx.HTTPStatusError as error:
+        print(f"La evaluación remota falló (HTTP {error.response.status_code}).", file=sys.stderr)
+        return 1
+    except Exception:
+        print("No se pudo ejecutar la evaluación remota. Verifica backend, identidad admin y clave.",
+              file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result["failed"] == 0 else 1
+
+
 if __name__ == "__main__":
-    import sys
-    base = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BASE_URL
-    print(f"Running golden set against {base}...")
-    result = asyncio.run(run_golden_set(base))
-    print(json.dumps(result, indent=2))
-    sys.exit(0 if result["failed"] == 0 else 1)
+    sys.exit(main())

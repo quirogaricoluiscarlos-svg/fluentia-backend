@@ -2,10 +2,12 @@
 
 import json
 import logging
+import os
+import threading
+import time
 import uuid
 from dataclasses import dataclass, field
-
-import time
+from time import monotonic as _session_now
 
 from services import deepseek_client, transcribe_audio
 
@@ -13,6 +15,22 @@ from guardrails import validate_scenario_turn
 from quality_log import log_ai_call
 
 logger = logging.getLogger(__name__)
+
+
+def _positive_setting(name: str, default: int) -> int:
+    value = int(os.environ.get(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+SCENARIO_SESSION_TTL_SECONDS = _positive_setting("SCENARIO_SESSION_TTL_SECONDS", 1800)
+SCENARIO_MAX_TURNS = _positive_setting("SCENARIO_MAX_TURNS", 20)
+SCENARIO_MAX_SESSIONS_PER_OWNER = _positive_setting("SCENARIO_MAX_SESSIONS_PER_OWNER", 3)
+SCENARIO_MAX_SESSIONS_TOTAL = _positive_setting("SCENARIO_MAX_SESSIONS_TOTAL", 1000)
+SCENARIO_HISTORY_TURNS = min(
+    _positive_setting("SCENARIO_HISTORY_TURNS", 10), SCENARIO_MAX_TURNS
+)
 
 SCENARIOS = {
     "smalltalk": {
@@ -95,6 +113,10 @@ Be encouraging. If the student struggles, gently guide them. Never break charact
 class ConversationSession:
     session_id: str
     scenario_id: str
+    owner_id: str | None = None
+    created_at: float = field(default_factory=_session_now)
+    last_activity_at: float = field(default_factory=_session_now)
+    turn_in_progress: bool = False
     messages: list[dict] = field(default_factory=list)
     objectives_met: list[str] = field(default_factory=list)
     turn_count: int = 0
@@ -102,25 +124,67 @@ class ConversationSession:
     total_score: float = 0.0
 
 
+# Process-local storage: a restart loses sessions; multiple workers cannot share
+# them. A shared/persistent store remains necessary before scaling deployment.
 _sessions: dict[str, ConversationSession] = {}
+_sessions_lock = threading.RLock()
 
 
-def start_scenario(scenario_id: str) -> tuple[str, dict] | None:
+def _purge_expired(now: float) -> None:
+    """Called with _sessions_lock held. Never remove an in-flight turn."""
+    expired = [
+        session_id for session_id, session in _sessions.items()
+        if not session.turn_in_progress
+        and now - session.last_activity_at >= SCENARIO_SESSION_TTL_SECONDS
+    ]
+    for session_id in expired:
+        del _sessions[session_id]
+
+
+def _get_owned_session(session_id: str, owner_id: str) -> ConversationSession | None:
+    """Unknown, expired and foreign sessions have the same public result."""
+    _purge_expired(_session_now())
+    session = _sessions.get(session_id)
+    if not isinstance(owner_id, str) or not owner_id.strip():
+        return None
+    if session is None or session.owner_id != owner_id:
+        return None
+    return session
+
+
+def start_scenario(
+    scenario_id: str, *, owner_id: str
+) -> tuple[str, dict] | dict | None:
+    if not isinstance(owner_id, str) or not owner_id.strip():
+        raise ValueError("An authenticated owner is required")
     scenario = SCENARIOS.get(scenario_id)
     if not scenario:
         return None
 
-    session_id = str(uuid.uuid4())
-    session = ConversationSession(
-        session_id=session_id,
-        scenario_id=scenario_id,
-    )
-    session.messages.append({
-        "role": "assistant",
-        "content": scenario["ai_greeting"],
-    })
-
-    _sessions[session_id] = session
+    with _sessions_lock:
+        now = _session_now()
+        _purge_expired(now)
+        owner_sessions = sum(session.owner_id == owner_id for session in _sessions.values())
+        if owner_sessions >= SCENARIO_MAX_SESSIONS_PER_OWNER:
+            return {
+                "error": "Ya tenés varias conversaciones abiertas. Finalizá una antes de iniciar otra.",
+                "status_code": 429,
+            }
+        if len(_sessions) >= SCENARIO_MAX_SESSIONS_TOTAL:
+            return {
+                "error": "Hay muchas conversaciones activas. Intentá de nuevo más tarde.",
+                "status_code": 429,
+            }
+        session_id = str(uuid.uuid4())
+        session = ConversationSession(
+            session_id=session_id,
+            scenario_id=scenario_id,
+            owner_id=owner_id,
+            created_at=now,
+            last_activity_at=now,
+            messages=[{"role": "assistant", "content": scenario["ai_greeting"]}],
+        )
+        _sessions[session_id] = session
 
     return session_id, {
         "session_id": session_id,
@@ -140,23 +204,56 @@ def start_scenario(scenario_id: str) -> tuple[str, dict] | None:
 
 
 async def process_turn(
-    session_id: str, audio_bytes: bytes, filename: str
+    session_id: str, audio_bytes: bytes, filename: str, *, owner_id: str
 ) -> dict | None:
-    session = _sessions.get(session_id)
-    if not session:
-        return None
+    with _sessions_lock:
+        session = _get_owned_session(session_id, owner_id)
+        if session is None:
+            return None
+        if session.turn_in_progress:
+            return {
+                "error": "Estamos procesando tu turno anterior. Esperá antes de enviar otro.",
+                "status_code": 409,
+            }
+        if session.turn_count >= SCENARIO_MAX_TURNS:
+            return {
+                "error": "Llegaste al límite de turnos. Finalizá esta conversación para iniciar otra.",
+                "status_code": 409,
+            }
+        session.turn_in_progress = True
 
+    try:
+        return await _process_owned_turn(session, audio_bytes, filename)
+    finally:
+        # Cancellation and every error release the guard. The completed request
+        # starts a fresh idle TTL even when the learner needs to retry.
+        with _sessions_lock:
+            session.last_activity_at = _session_now()
+            session.turn_in_progress = False
+
+
+async def _process_owned_turn(
+    session: ConversationSession, audio_bytes: bytes, filename: str
+) -> dict:
     scenario = SCENARIOS[session.scenario_id]
 
-    transcription = await transcribe_audio(audio_bytes, filename)
-    if not transcription.strip():
+    try:
+        transcription = await transcribe_audio(audio_bytes, filename)
+    except Exception:
+        logger.warning("Scenario transcription unavailable")
+        return {
+            "error": "No pudimos transcribir el audio. Intentá de nuevo.",
+            "status_code": 503,
+        }
+    if not isinstance(transcription, str) or not transcription.strip():
         return {
             "error": "No se detectó habla en el audio. Intentá de nuevo.",
             "turn_count": session.turn_count,
         }
 
-    session.messages.append({"role": "user", "content": transcription})
-    session.turn_count += 1
+    # Build a provisional history: failed/invalid/cancelled requests must not
+    # count as learner turns or leave unmatched user messages behind.
+    messages = [*session.messages, {"role": "user", "content": transcription}]
 
     system_prompt = _build_system_prompt(scenario, session.objectives_met)
 
@@ -168,7 +265,7 @@ async def process_turn(
                 model="deepseek-chat",
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    *session.messages,
+                    *messages,
                 ],
                 temperature=0.4,
                 response_format={"type": "json_object"},
@@ -191,10 +288,16 @@ async def process_turn(
             )
             logger.error("Scenario turn failed: %s", e)
             if attempt == 1:
-                return {"error": "Error al procesar el turno. Intentá de nuevo."}
+                return {
+                    "error": "Error al procesar el turno. Intentá de nuevo.",
+                    "status_code": 503,
+                }
 
     if ai_data is None:
-        return {"error": "No pudimos generar una respuesta válida. Intentá de nuevo."}
+        return {
+            "error": "No pudimos generar una respuesta válida. Intentá de nuevo.",
+            "status_code": 503,
+        }
 
     data = ai_data
 
@@ -203,7 +306,9 @@ async def process_turn(
     explanation = data.get("explanation")
     new_objectives = data.get("objectives_met", [])
 
-    session.messages.append({"role": "assistant", "content": ai_response})
+    messages.append({"role": "assistant", "content": ai_response})
+    session.messages = [messages[0], *messages[1:][-2 * SCENARIO_HISTORY_TURNS:]]
+    session.turn_count += 1
 
     if correction:
         session.corrections_count += 1
@@ -218,22 +323,29 @@ async def process_turn(
     all_met = len(session.objectives_met) >= len(scenario["objectives_checklist"])
 
     return {
-        "session_id": session_id,
+        "session_id": session.session_id,
         "turn_count": session.turn_count,
         "transcription": transcription,
         "ai_response": ai_response,
         "correction": correction,
         "explanation": explanation,
-        "objectives_met": session.objectives_met,
+        "objectives_met": list(session.objectives_met),
         "objectives_total": scenario["objectives_checklist"],
         "all_objectives_met": all_met,
     }
 
 
-def end_scenario(session_id: str) -> dict | None:
-    session = _sessions.pop(session_id, None)
-    if not session:
-        return None
+def end_scenario(session_id: str, *, owner_id: str) -> dict | None:
+    with _sessions_lock:
+        session = _get_owned_session(session_id, owner_id)
+        if session is None:
+            return None
+        if session.turn_in_progress:
+            return {
+                "error": "Estamos procesando tu último turno. Esperá antes de finalizar.",
+                "status_code": 409,
+            }
+        del _sessions[session_id]
 
     scenario = SCENARIOS[session.scenario_id]
     avg_score = (session.total_score / session.turn_count) if session.turn_count > 0 else 0
